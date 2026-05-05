@@ -1,0 +1,13 @@
+[project]
+name = "server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.136.1",
+    "groq>=1.2.0",
+    "langgraph>=1.1.10",
+    "sqlmodel>=0.0.38",
+    "uvicorn>=0.46.0",
+]
