@@ -10,8 +10,8 @@ from langgraph.graph import END, START, StateGraph
 from sqlmodel import Session, select
 
 from llm import extract_entities
-from models import Interaction
-from services.hcp_service import get_or_create_hcp_by_name, search_hcps
+from models import HCP, Interaction
+from services.hcp_service import get_or_create_hcp_by_name, hcp_match_score, normalize_hcp_query, search_hcps
 from services.interaction_service import (
     build_followup_recommendations,
     build_interaction_summary,
@@ -41,6 +41,8 @@ class AssistantState(TypedDict, total=False):
     summary: str
     recommendations: list[str]
     search_results: list[Any]
+    followup_matches: list[dict[str, Any]]
+    interaction_matches: list[dict[str, Any]]
     interaction: Any
     extracted: dict[str, Any]
 
@@ -117,14 +119,83 @@ def _heuristic_classify(text: str) -> dict[str, str]:
     if query_match:
       query = query_match.group(1).strip()
 
+    name_only_match = re.search(r"\b(?:dr|doctor|mr|mrs|ms)\.?\s+(.+)$", text, re.I)
+    if name_only_match and not query_match:
+        query = name_only_match.group(0).strip()
+
     if intent == "summary" and not query_match:
         query = ""
 
     return {"intent": intent, "query": query}
 
 
+def _looks_like_hcp_search(text: str) -> bool:
+    normalized = text.lower().strip()
+    if re.search(r"\b(search|find|look up|lookup|locate)\b", normalized):
+        return True
+    if _looks_like_interaction_note(text):
+        return False
+    if re.search(r"\b(interaction|interactions|hcp)\b", normalized):
+        return True
+
+    words = re.findall(r"[a-z]+", normalized)
+    if 1 <= len(words) <= 3 and any(re.search(rf"\b(?:dr|doctor|mr|mrs|ms)\.?\s+{word}\b", normalized) for word in words):
+        return True
+    return False
+
+
+def _looks_like_interaction_note(text: str) -> bool:
+    normalized = text.lower().strip()
+    sentence_count = len(re.findall(r"[.!?]", normalized))
+    has_action = bool(re.search(r"\b(called|met|visited|discussed|shared|requested|committed|sent|provided|gave|pitched|concerns?)\b", normalized))
+    has_sentiment = bool(re.search(r"\b(positive|negative|neutral|interested|dismissive|uninterested|not positive|not interested)\b", normalized))
+    word_count = len(re.findall(r"[a-z0-9]+", normalized))
+    return (sentence_count >= 1 and has_action) or (has_action and has_sentiment) or (word_count >= 14 and has_action)
+
+
+def _looks_like_followup_query(text: str) -> bool:
+    normalized = text.lower().strip()
+    if "?" in text:
+        return True
+    if re.search(r"\b(any|what|which|show|list|find|lookup|search|scheduled|upcoming)\b", normalized):
+        return True
+    if re.search(r"\bfollow[- ]?up(s)?\b", normalized) and re.search(r"\b(any|what|which|show|list|find|lookup|search|scheduled|upcoming)\b", normalized):
+        return True
+    return False
+
+
+def _looks_like_followup_update_text(text: str) -> bool:
+    normalized = text.lower().strip()
+    has_followup_action = bool(re.search(r"\b(callback|call back|call|connect|reach out|schedule|meet)\b", normalized))
+    has_time_hint = bool(re.search(r"\b(today|tomorrow|yesterday|next|morning|afternoon|evening|night|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b", normalized))
+    has_query_intent = _looks_like_followup_query(text)
+    has_sentiment_words = bool(re.search(r"\b(positive|negative|neutral|interested|dismissive|uninterested|concern)\b", normalized))
+    return has_followup_action and has_time_hint and not has_query_intent and not has_sentiment_words
+
+
+def _normalize_person_name(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z\s]", " ", value or "")
+    cleaned = re.sub(r"\b(dr|doctor|mr|mrs|ms|miss)\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return cleaned
+
+
 def _classify_request(text: str) -> dict[str, str]:
-    return _classify_with_groq(text)
+    try:
+        classification = _classify_with_groq(text)
+    except Exception:
+        classification = _heuristic_classify(text)
+
+    if _looks_like_interaction_note(text):
+        classification["intent"] = "log"
+        classification["query"] = ""
+        return classification
+
+    if classification.get("intent") in {"generic", "log"} and _looks_like_hcp_search(text):
+        classification["intent"] = "search"
+        classification["query"] = text.strip()
+
+    return classification
 
 
 def _latest_interaction(session: Session, hcp_id: int | None) -> Interaction | None:
@@ -198,6 +269,64 @@ def _build_message(intent: str, **context: Any) -> str:
     return "I can log a new interaction, search HCPs, summarize the latest note, or suggest follow-ups."
 
 
+def _hcp_name_for_interaction(session: Session, interaction: Interaction) -> str:
+    if interaction.hcp_id is None:
+        return "Unknown HCP"
+    hcp = session.get(HCP, interaction.hcp_id)
+    return hcp.name if hcp and hcp.name else f"HCP #{interaction.hcp_id}"
+
+
+def _serialize_followup_match(session: Session, interaction: Interaction) -> dict[str, Any]:
+    return {
+        "interaction": interaction,
+        "hcp_id": interaction.hcp_id,
+        "hcp_name": _hcp_name_for_interaction(session, interaction),
+        "follow_up": interaction.follow_up,
+    }
+
+
+def _serialize_interaction_match(session: Session, interaction: Interaction) -> dict[str, Any]:
+    return {
+        "interaction": interaction,
+        "hcp_id": interaction.hcp_id,
+        "hcp_name": _hcp_name_for_interaction(session, interaction),
+        "title": interaction.topics or interaction.interaction_type or "Interaction",
+    }
+
+
+def _find_interactions_for_hcp_query(session: Session, query: str, limit: int = 10) -> list[Interaction]:
+    normalized_query = normalize_hcp_query(query)
+    query_tokens = normalized_query.split()
+    matched_hcps = search_hcps(session=session, query=query, limit=25)
+    hcp_scores = {hcp.id: hcp_match_score(hcp.name, query) for hcp in matched_hcps if hcp.id is not None}
+
+    interactions = session.exec(select(Interaction)).all()
+    scored: list[tuple[Interaction, int]] = []
+    for interaction in interactions:
+        score = hcp_scores.get(interaction.hcp_id, 0)
+        haystack = normalize_hcp_query(
+            " ".join(
+                part
+                for part in (
+                    interaction.notes,
+                    interaction.attendees,
+                    interaction.topics,
+                    interaction.outcomes,
+                    interaction.follow_up,
+                )
+                if part
+            )
+        )
+        for token in query_tokens:
+            if token and token in haystack:
+                score += 15
+        if score > 0:
+            scored.append((interaction, score))
+
+    scored.sort(key=lambda item: (-item[1], -(item[0].id or 0)))
+    return [interaction for interaction, _ in scored[:limit]]
+
+
 def _build_graph(session: Session):
     def classify_node(state: AssistantState) -> AssistantState:
         text = state.get("text", "")
@@ -205,12 +334,10 @@ def _build_graph(session: Session):
         
         classification = _classify_request(text)
         intent = classification.get("intent", "generic")
-        
-        # If an interaction is already selected and this isn't a query intent,
-        # treat it as an update instead of a new log
-        if interaction_id is not None and intent in ("log", "generic"):
+        if interaction_id is not None and intent == "followup" and not _looks_like_followup_query(text):
+            # When user is editing a selected interaction, treat declarative follow-up text as an update.
             intent = "update"
-        
+
         return {
             **state,
             "intent": intent,
@@ -225,14 +352,40 @@ def _build_graph(session: Session):
         resolved_hcp_id = state.get("hcp_id")
 
         parsed_hcp_name = parsed.get("hcp_name")
-        if not resolved_hcp_id and isinstance(parsed_hcp_name, str) and parsed_hcp_name.strip():
-            hcp = get_or_create_hcp_by_name(session, parsed_hcp_name.strip())
-            resolved_hcp_id = hcp.id
+        if isinstance(parsed_hcp_name, str) and parsed_hcp_name.strip():
+            parsed_hcp_normalized = _normalize_person_name(parsed_hcp_name)
+            selected_hcp = session.get(HCP, resolved_hcp_id) if resolved_hcp_id else None
+            selected_hcp_normalized = _normalize_person_name(selected_hcp.name) if selected_hcp else ""
+            if not resolved_hcp_id or (parsed_hcp_normalized and selected_hcp_normalized and parsed_hcp_normalized != selected_hcp_normalized):
+                hcp = get_or_create_hcp_by_name(session, parsed_hcp_name.strip())
+                resolved_hcp_id = hcp.id
 
         # Check if we're continuing an existing interaction
         if interaction_id is not None:
             try:
                 interaction = get_interaction_or_404(session, interaction_id)
+                selected_hcp = session.get(HCP, interaction.hcp_id) if interaction.hcp_id else None
+                selected_name = _normalize_person_name(selected_hcp.name if selected_hcp else "")
+                parsed_name = _normalize_person_name(str(parsed_hcp_name or ""))
+                different_hcp = bool(parsed_name and selected_name and parsed_name != selected_name)
+                if different_hcp:
+                    interaction = create_interaction_from_text(
+                        session=session,
+                        text=text,
+                        hcp_id=resolved_hcp_id,
+                        parsed=parsed,
+                    )
+                    return {
+                        **state,
+                        "intent": "log",
+                        "interaction": interaction,
+                        "extracted": parsed,
+                        "assistant_message": _build_message(
+                            "log",
+                            hcp_name=parsed.get("hcp_name") or (f"HCP #{interaction.hcp_id}" if interaction.hcp_id else None),
+                            interaction_type=interaction.interaction_type,
+                        ),
+                    }
                 # Append the new text to the existing notes
                 existing_notes = interaction.notes or ""
                 interaction.notes = f"{existing_notes}\n\n{text}" if existing_notes else text
@@ -293,25 +446,40 @@ def _build_graph(session: Session):
         
         # Use the first matching interaction
         target = followup_interactions[0]
+        matches = [_serialize_followup_match(session, item) for item in followup_interactions]
         
         # Build message showing the followup details
         followup_text = target.follow_up or ""
+        hcp_name = _hcp_name_for_interaction(session, target)
+        count = len(followup_interactions)
         return {
             **state,
             "intent": "followup",
             "interaction": target,
+            "followup_matches": matches,
             "recommendations": [followup_text] if followup_text else [],
-            "assistant_message": f"Found followup scheduled: {followup_text}" if followup_text else "Loaded followup interaction.",
+            "assistant_message": f"Loaded nearest follow-up for {hcp_name}: {followup_text}" if count == 1 else f"Found {count} follow-ups. Loaded nearest: {hcp_name}.",
         }
 
     def search_node(state: AssistantState) -> AssistantState:
         query = state.get("query") or state.get("text", "")
         results = search_hcps(session=session, query=query, limit=5)
+        interaction_matches = _find_interactions_for_hcp_query(session, query, limit=10)
+        target = interaction_matches[0] if interaction_matches else None
+        serialized_matches = [_serialize_interaction_match(session, item) for item in interaction_matches]
+        if target is not None:
+            hcp_name = _hcp_name_for_interaction(session, target)
+            count = len(interaction_matches)
+            message = f"Found {count} interaction match(es). Loaded first: {hcp_name}."
+        else:
+            message = _build_message("search", search_results=results, query=query)
         return {
             **state,
             "intent": "search",
+            "interaction": target,
+            "interaction_matches": serialized_matches,
             "search_results": results,
-            "assistant_message": _build_message("search", search_results=results, query=query),
+            "assistant_message": message,
         }
 
     def update_node(state: AssistantState) -> AssistantState:
@@ -319,16 +487,24 @@ def _build_graph(session: Session):
         if target is None:
             return {**state, "intent": "update", "assistant_message": "I could not find an interaction to update."}
 
-        parsed = extract_entities(state.get("text", ""))
+        text = state.get("text", "")
+        parsed = extract_entities(text)
         updates: dict[str, Any] = {}
+        followup_only_update = _looks_like_followup_update_text(text)
         
-        for key in (
-            "interaction_type",
-            "datetime",
-            "sentiment",
-            "outcomes",
-            "follow_up",
-        ):
+        fields_to_update: tuple[str, ...]
+        if followup_only_update:
+            fields_to_update = ("follow_up",)
+        else:
+            fields_to_update = (
+                "interaction_type",
+                "datetime",
+                "sentiment",
+                "outcomes",
+                "follow_up",
+            )
+
+        for key in fields_to_update:
             value = parsed.get(key)
             if value not in {None, ""}:
                 updates[key] = value
@@ -385,7 +561,7 @@ def _build_graph(session: Session):
                 updates["samples_distributed"] = parsed_samples
 
         # Append to notes
-        notes = state.get("text", "")
+        notes = text
         if notes:
             existing_notes = target.notes or ""
             updates["notes"] = f"{existing_notes}\n\n{notes}" if existing_notes else notes
@@ -445,7 +621,7 @@ def run_assistant_request(
         "assistant_message": state.get("assistant_message") or _build_message("generic"),
     }
 
-    for key in ("interaction", "summary", "recommendations", "search_results", "extracted"):
+    for key in ("interaction", "summary", "recommendations", "search_results", "followup_matches", "interaction_matches", "extracted"):
         value = state.get(key)
         if value:
             response[key] = value

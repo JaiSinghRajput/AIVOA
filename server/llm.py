@@ -13,6 +13,18 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "gemma2-9b-it")
 GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 
 
+def _preprocess_text(text: str) -> str:
+    normalized = re.sub(r"(?<=\d);(?=\d)", ":", text)
+    for typo in ("tummarow", "tommorow", "tomarrow", "tommorrow"):
+        normalized = re.sub(rf"\b{typo}\b", "tomorrow", normalized, flags=re.I)
+    return normalized
+
+
+def _has_time(text: str) -> bool:
+    normalized = _preprocess_text(text)
+    return bool(re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{1,2}:\d{2}\b", normalized, re.I))
+
+
 def _extract_materials(text: str) -> str | None:
     matches: list[str] = []
     for pattern, label in (
@@ -40,23 +52,64 @@ def _extract_materials(text: str) -> str | None:
 
 
 def _split_followup_section(text: str) -> tuple[str, str]:
-    match = re.search(r"\b(?:follow[- ]?up|follow up|next steps?)\b", text, re.I)
+    normalized = _preprocess_text(text)
+    match = re.search(r"\b(?:follow[- ]?up|follow up|next steps?)\b", normalized, re.I)
     if not match:
-        return text, ""
-    return text[: match.start()].strip(), text[match.start() :].strip()
+        match = re.search(
+            r"\b(?:connect with|call|schedule|reach out to|meet with)\b(?=.*\b(?:today|tomorrow|yesterday|evening|morning|afternoon|\d{1,2}(?::\d{2})?\s*(?:am|pm)))",
+            normalized,
+            re.I,
+        )
+    if not match:
+        return normalized, ""
+    return normalized[: match.start()].strip(), normalized[match.start() :].strip()
+
+
+def _clean_person_name(name: str) -> str | None:
+    stop_words = {
+        "also",
+        "present",
+        "attended",
+        "joined",
+        "was",
+        "were",
+        "with",
+        "and",
+        "he",
+        "she",
+        "said",
+        "connect",
+        "tomorrow",
+        "today",
+        "evening",
+        "morning",
+        "afternoon",
+    }
+    parts: list[str] = []
+    for token in re.findall(r"[A-Za-z][A-Za-z'-]*", name):
+        if token.lower() in stop_words:
+            break
+        parts.append(token)
+        if len(parts) == 3:
+            break
+
+    if not parts:
+        return None
+    return " ".join(part.capitalize() for part in parts)
 
 
 def _extract_attendees(text: str, hcp_name: str | None = None) -> str | None:
     attendees: list[str] = []
+    title_name = r"(?:Mr\.?|Ms\.?|Mrs\.?|Dr\.?)\s+([A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*){0,4})"
     patterns = [
-        r"(?:also\s+present|was\s+also\s+present|were\s+also\s+present|also\s+attended|was\s+there)\s+(?:Mr\.?|Ms\.?|Mrs\.?|Dr\.?)\s+([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+)*)",
-        r"(?:Mr\.?|Ms\.?|Mrs\.?|Dr\.?)\s+([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+)*)\s+(?:was\s+also\s+present|was\s+present|attended|joined)",
-        r"\b(?:with|along with|together with)\s+(?:Mr\.?|Ms\.?|Mrs\.?|Dr\.?)?\s*([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+)*)",
+        rf"(?:also\s+present|was\s+also\s+present|were\s+also\s+present|also\s+attended|was\s+there)\s+{title_name}",
+        rf"{title_name}\s+(?:was\s+also\s+present|was\s+present|were\s+present|attended|joined|also\s+present)",
+        rf"\b(?:along with|together with)\s+{title_name}",
     ]
 
     for pattern in patterns:
         for name in re.findall(pattern, text, re.I):
-            cleaned = name.strip()
+            cleaned = _clean_person_name(name)
             if cleaned and cleaned not in attendees:
                 attendees.append(cleaned)
 
@@ -102,9 +155,15 @@ def _extract_topics(text: str) -> str | None:
 
 
 def _extract_followup_text(text: str) -> str | None:
-    match = re.search(r"\b(?:follow[- ]?up|follow up|next steps?)\b[:\-]?\s*(.+)$", text, re.I)
+    normalized = _preprocess_text(text)
+    match = re.search(r"\b(?:follow[- ]?up|follow up|next steps?)\b[:\-]?\s*(.+)$", normalized, re.I)
     if match:
-        followup = match.group(1).strip()
+        followup = re.sub(r"\s+(?:and|then)\s*$", "", match.group(1).strip(), flags=re.I)
+        return followup if followup else None
+
+    match = re.search(r"\b(?:said to\s+)?((?:connect with|call|schedule|reach out to|meet with)\s+.+)$", normalized, re.I)
+    if match and re.search(r"\b(?:today|tomorrow|yesterday|evening|morning|afternoon|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", match.group(1), re.I):
+        followup = re.sub(r"\s+(?:and|then)\s*$", "", match.group(1).strip(), flags=re.I)
         return followup if followup else None
     return None
 
@@ -117,6 +176,7 @@ def _extract_datetime_with_time_hint(text: str) -> str | None:
 
 
 def _extract_datetime(text: str) -> str | None:
+    text = _preprocess_text(text)
     text_lower = text.lower()
     base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -167,9 +227,21 @@ def _extract_datetime(text: str) -> str | None:
             hour += 12
         if meridiem == "am" and hour == 12:
             hour = 0
+        if meridiem is None and re.search(r"\b(evening|night)\b", text, re.I) and 1 <= hour < 12:
+            hour += 12
 
     combined = date_value.replace(hour=hour, minute=minute, second=0, microsecond=0)
     return combined.isoformat(timespec="minutes")
+
+
+def _extract_first_datetime(text: str) -> str | None:
+    return _extract_datetime(text)
+
+
+def _extract_interaction_datetime(text: str) -> str | None:
+    if not _has_time(text):
+        return None
+    return _extract_datetime(text)
 
 
 def _normalize_interaction_type(value: Any) -> str | None:
@@ -190,6 +262,7 @@ def _normalize_interaction_type(value: Any) -> str | None:
 
 
 def _heuristic_extract(text: str) -> Dict[str, Any]:
+    text = _preprocess_text(text)
     out: Dict[str, Any] = {}
     if re.search(r"\b(meeting|met|visited|visit)\b", text, re.I):
         out["interaction_type"] = "Meeting"
@@ -201,6 +274,10 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
         out["interaction_type"] = "Event"
 
     main_text, followup_text = _split_followup_section(text)
+
+    datetime_value = _extract_interaction_datetime(main_text)
+    if datetime_value:
+        out["datetime"] = datetime_value
 
     # Extract main HCP - look for "Met with Dr. X" or first doctor mention
     m = re.search(r"(?:met with|visited|called|meet(?:ed)? with)\s+(Dr\.?\s+)?([A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'-]+)*)", main_text, re.I)
@@ -216,11 +293,11 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
     if attendees:
         out["attendees"] = attendees
 
-    # Extract sentiment
-    if re.search(r"\b(interested|positive|good|liked|likes|love|support|committed|enthusiastic|great)\b", text, re.I):
-        out["sentiment"] = "positive"
-    elif re.search(r"\b(concern|concerned|not interested|negative|didn't|dislike|price|dismissive|objection)\b", text, re.I):
+    # Extract sentiment: check explicit negative cues before positive to avoid "not positive" being tagged positive.
+    if re.search(r"\b(not positive|not interested|uninterested|dismissive|negative|didn't|did not|dislike|objection|concern|concerned)\b", text, re.I):
         out["sentiment"] = "negative"
+    elif re.search(r"\b(interested|positive|good|liked|likes|love|support|committed|enthusiastic|great)\b", text, re.I):
+        out["sentiment"] = "positive"
     else:
         out["sentiment"] = "neutral"
 
@@ -229,13 +306,14 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
         out["topics"] = topics
 
     # Extract materials shared
-    if re.search(r"(?:shared|provided|gave|sent)\s+(?:.*?)(?:brochures?|flyers?|leaflets?|whitepapers?|pamphlets?|presentations?|slides?|materials?)", text, re.I):
-        out["materials_shared"] = "yes"
+    materials = _extract_materials(text)
+    if materials:
+        out["materials_shared"] = materials
 
     # Extract samples distributed
     s = re.search(r"\b(samples?|starter packs?|kits?)\b(?:\s+(?:distributed|shared|left|given|provided|requested))?", text, re.I)
     if s:
-        out["samples_distributed"] = s.group(1).strip()
+        out["samples_distributed"] = "yes"
 
     # Extract outcomes - look for commitments, agreements
     o = re.search(r"(?:committed to|agreed to|will|outcome[s]?[:\-]?\s*)([^\.]+)", main_text, re.I)
@@ -275,6 +353,7 @@ def _heuristic_extract(text: str) -> Dict[str, Any]:
 
 def _normalize_output(parsed: Dict[str, Any], text: str) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {}
+    text = _preprocess_text(text)
     text_lower = text.lower()
     main_text, followup_text = _split_followup_section(text)
 
@@ -292,30 +371,33 @@ def _normalize_output(parsed: Dict[str, Any], text: str) -> Dict[str, Any]:
     if normalized_interaction_type:
         normalized["interaction_type"] = normalized_interaction_type
 
+    inferred_main_datetime = _extract_interaction_datetime(main_text)
     datetime_value = parsed.get("datetime")
-    if isinstance(datetime_value, str) and datetime_value.strip():
+    if inferred_main_datetime:
+        normalized["datetime"] = inferred_main_datetime
+    elif isinstance(datetime_value, str) and datetime_value.strip():
         normalized_datetime = _extract_first_datetime(datetime_value)
-        if normalized_datetime:
+        followup_datetime = _extract_datetime(followup_text) if followup_text else None
+        raw_datetime = datetime_value.strip()
+        is_followup_datetime = bool(followup_datetime and normalized_datetime == followup_datetime)
+
+        if normalized_datetime and not is_followup_datetime:
             normalized["datetime"] = normalized_datetime
-        else:
+        elif not is_followup_datetime and not followup_text:
             normalized["datetime"] = datetime_value.strip()
 
         # If the parsed datetime lost the time component, recover it from the full text.
-        if re.search(r"T00:00$| 00:00$|^\d{4}-\d{2}-\d{2}$", normalized["datetime"]) and re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{1,2}:\d{2}\b", text, re.I):
-            inferred_full_datetime = _extract_datetime_with_time_hint(text)
+        if normalized.get("datetime") and re.search(r"T00:00$| 00:00$|^\d{4}-\d{2}-\d{2}$", raw_datetime) and _has_time(main_text):
+            inferred_full_datetime = _extract_datetime_with_time_hint(main_text)
             if inferred_full_datetime:
                 normalized["datetime"] = inferred_full_datetime
     else:
-        inferred_datetime = _extract_first_datetime(main_text)
+        inferred_datetime = _extract_interaction_datetime(main_text)
         if inferred_datetime:
             normalized["datetime"] = inferred_datetime
-        else:
-            inferred_datetime = _extract_first_datetime(text)
-            if inferred_datetime:
-                normalized["datetime"] = inferred_datetime
 
     attendees = parsed.get("attendees")
-    if isinstance(attendees, str) and attendees.strip():
+    if isinstance(attendees, str) and attendees.strip() and not re.search(r"\b(?:said|connect|tomorrow|today|present and|there are|their are)\b", attendees, re.I):
         normalized["attendees"] = attendees.strip()
     else:
         extracted_attendees = _extract_attendees(text, normalized.get("hcp_name"))
@@ -337,7 +419,7 @@ def _normalize_output(parsed: Dict[str, Any], text: str) -> Dict[str, Any]:
     extracted_materials = _extract_materials(text)
     if extracted_materials:
         normalized["materials_shared"] = extracted_materials
-    elif re.search(r"\b(sample|samples|brochure|flyer|leaflet|starter pack|starter packs|kit|kits)\b", text_lower):
+    elif re.search(r"\b(brochure|flyer|leaflet|whitepaper|pamphlet|presentation|slides?|materials?)\b", text_lower):
         normalized["materials_shared"] = "yes"
 
     samples_distributed = parsed.get("samples_distributed")
@@ -384,7 +466,9 @@ def _extract_with_groq(text: str) -> Dict[str, Any]:
     client = Groq(api_key=api_key)
     prompt = (
         "Extract the fields from this HCP interaction note and return ONLY a JSON object with keys: "
-        "hcp_name, interaction_type, datetime, attendees, sentiment (positive/neutral/negative), topics, materials_shared (yes/no), samples_distributed, outcomes, follow_up, notes.\n\n"
+        "hcp_name, interaction_type, datetime, attendees, sentiment (positive/neutral/negative), topics, materials_shared, samples_distributed, outcomes, follow_up, notes. "
+        "For attendees, return only person names. For materials_shared, return the material names such as brochures, not yes/no. "
+        "For samples_distributed, return yes or no. Put planned next contact in follow_up, not datetime.\n\n"
         f"Text:\n{text}"
     )
     content = ""

@@ -25,6 +25,20 @@ export interface Interaction {
   notes?: string | null
 }
 
+export interface FollowupMatch {
+  interaction: Interaction
+  hcp_id?: number | null
+  hcp_name: string
+  follow_up?: string | null
+}
+
+export interface InteractionMatch {
+  interaction: Interaction
+  hcp_id?: number | null
+  hcp_name: string
+  title?: string | null
+}
+
 interface LogResponse {
   intent?: 'log' | 'summary' | 'followup' | 'search' | 'update' | 'generic'
   request_text?: string
@@ -34,6 +48,8 @@ interface LogResponse {
   summary?: string
   recommendations?: string[]
   search_results?: Hcp[]
+  followup_matches?: FollowupMatch[]
+  interaction_matches?: InteractionMatch[]
 }
 
 interface SummaryResponse {
@@ -246,21 +262,6 @@ const crmSlice = createSlice({
       .addCase(loadInteractions.fulfilled, (state, action) => {
         state.loading = false
         state.interactions = action.payload
-        // Extract unique HCPs from interactions
-        const hcpMap = new Map<number, Hcp>()
-        for (const interaction of action.payload) {
-          if (interaction.hcp_id) {
-            // Create a minimal HCP object from interaction data
-            const hcpKey = `hcp_${interaction.hcp_id}`
-            if (!hcpMap.has(interaction.hcp_id)) {
-              hcpMap.set(interaction.hcp_id, {
-                id: interaction.hcp_id,
-                name: hcpKey, // Fallback name
-              })
-            }
-          }
-        }
-        state.hcps = Array.from(hcpMap.values())
       })
       .addCase(loadInteractions.rejected, (state, action) => {
         state.loading = false
@@ -280,6 +281,21 @@ const crmSlice = createSlice({
         const extracted = action.payload.extracted ?? {}
         const inter = action.payload.interaction
         const wasExistingInteraction = state.selectedInteractionId === inter?.id
+
+        if (action.payload.followup_matches) {
+          for (const match of action.payload.followup_matches) {
+            if (match.hcp_id && match.hcp_name && !state.hcps.some((hcp) => hcp.id === match.hcp_id)) {
+              state.hcps.push({ id: match.hcp_id, name: match.hcp_name })
+            }
+          }
+        }
+        if (action.payload.interaction_matches) {
+          for (const match of action.payload.interaction_matches) {
+            if (match.hcp_id && match.hcp_name && !state.hcps.some((hcp) => hcp.id === match.hcp_id)) {
+              state.hcps.push({ id: match.hcp_id, name: match.hcp_name })
+            }
+          }
+        }
 
         if (inter) {
           state.selectedInteractionId = inter.id
@@ -321,7 +337,8 @@ const crmSlice = createSlice({
             state.selectedHcpId = inter.hcp_id
           }
 
-          state.hcpQuery = extracted.hcp_name ?? state.hcpQuery
+          const matchedHcp = inter.hcp_id ? state.hcps.find((hcp) => hcp.id === inter.hcp_id) : null
+          state.hcpQuery = extracted.hcp_name ?? matchedHcp?.name ?? state.hcpQuery
         }
 
         if (action.payload.summary) {

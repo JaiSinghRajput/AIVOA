@@ -1,11 +1,15 @@
 from fastapi import HTTPException
 from sqlmodel import Session, select
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
+import os
+from dotenv import load_dotenv
 
 from llm import extract_entities
 from models import Interaction
 from services.hcp_service import get_or_create_hcp_by_name
+
+load_dotenv()
 
 
 def create_interaction_from_text(
@@ -15,6 +19,10 @@ def create_interaction_from_text(
     parsed: dict[str, object] | None = None,
 ) -> Interaction:
     parsed = parsed or extract_entities(text)
+    parsed_datetime = parsed.get("datetime")
+    if not isinstance(parsed_datetime, str) or not parsed_datetime.strip():
+        # For new entries with no date/time context in text, use current timestamp.
+        parsed["datetime"] = datetime.now().isoformat(timespec="minutes")
 
     resolved_hcp_id = hcp_id
     parsed_hcp_name = parsed.get("hcp_name")
@@ -67,6 +75,82 @@ def list_interactions(session: Session, hcp_id: int | None, limit: int) -> list[
     return session.exec(stmt).all()[:limit]
 
 
+def _clean_date_text(text: str) -> str:
+    cleaned = re.sub(r"(?<=\d);(?=\d)", ":", text or "")
+    for typo in ("tummarow", "tummarrow", "tommorow", "tomarrow", "tommorrow"):
+        cleaned = re.sub(rf"\b{typo}\b", "tomorrow", cleaned, flags=re.I)
+    return cleaned
+
+
+def _parse_relative_datetime(text: str) -> datetime | None:
+    cleaned = _clean_date_text(text)
+    lower = cleaned.lower()
+    base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    date_value: datetime | None = None
+    if "tomorrow" in lower:
+        date_value = base + timedelta(days=1)
+    elif "today" in lower:
+        date_value = base
+    elif "yesterday" in lower:
+        date_value = base - timedelta(days=1)
+    else:
+        iso_date = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", cleaned)
+        if iso_date:
+            try:
+                date_value = datetime.fromisoformat(iso_date.group(1))
+            except ValueError:
+                date_value = None
+
+    if date_value is None:
+        return None
+
+    hour = 0
+    minute = 0
+    time_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", cleaned, re.I)
+    if not time_match:
+        time_match = re.search(r"\b(\d{1,2}):(\d{2})\b", cleaned)
+
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        meridiem = time_match.group(3).lower() if time_match.lastindex and time_match.lastindex >= 3 and time_match.group(3) else None
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+        if meridiem is None and re.search(r"\b(evening|night)\b", cleaned, re.I) and 1 <= hour < 12:
+            hour += 12
+
+    return date_value.replace(hour=hour, minute=minute)
+
+
+def _query_date_window(query_text: str) -> tuple[datetime, datetime] | None:
+    lower = _clean_date_text(query_text).lower()
+    base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if "tomorrow" in lower:
+        start = base + timedelta(days=1)
+        return start, start + timedelta(days=1)
+    if "today" in lower:
+        return base, base + timedelta(days=1)
+    if "this week" in lower:
+        return base, base + timedelta(days=7)
+    if "next week" in lower:
+        start = base + timedelta(days=7)
+        return start, start + timedelta(days=7)
+    if "next month" in lower:
+        start = base + timedelta(days=30)
+        return start, start + timedelta(days=30)
+
+    explicit = _parse_relative_datetime(lower)
+    if explicit:
+        start = explicit.replace(hour=0, minute=0)
+        return start, start + timedelta(days=1)
+
+    return None
+
+
 def find_interactions_by_followup_date(
     session: Session, 
     query_text: str, 
@@ -74,8 +158,8 @@ def find_interactions_by_followup_date(
     limit: int = 10
 ) -> list[Interaction]:
     """Find interactions with followups matching a date mentioned in the query."""
-    # Extract target date from query (e.g., "tomorrow", "next week", "2026-05-06")
-    query_lower = query_text.lower()
+    query_lower = _clean_date_text(query_text).lower()
+    window = _query_date_window(query_text)
     
     # Get all interactions with followups
     stmt = select(Interaction).where(Interaction.follow_up != None)
@@ -87,18 +171,23 @@ def find_interactions_by_followup_date(
     if not interactions:
         return []
     
-    # Filter by date mentioned in query
-    matches: list[tuple[Interaction, int]] = []
+    matches: list[tuple[Interaction, int, datetime]] = []
     
     for interaction in interactions:
         if not interaction.follow_up:
             continue
             
-        followup_lower = interaction.follow_up.lower()
+        followup_lower = _clean_date_text(interaction.follow_up).lower()
+        followup_dt = _parse_relative_datetime(interaction.follow_up) or datetime.max.replace(microsecond=0)
         score = 0
+
+        if window and followup_dt != datetime.max.replace(microsecond=0):
+            start, end = window
+            if start <= followup_dt < end:
+                score = 200
         
         # Check if query mentions match followup text
-        if "tomorrow" in query_lower and "tomorrow" in followup_lower:
+        if score == 0 and "tomorrow" in query_lower and "tomorrow" in followup_lower:
             score = 100
         elif "today" in query_lower and "today" in followup_lower:
             score = 100
@@ -118,48 +207,75 @@ def find_interactions_by_followup_date(
             score = 10
         
         if score > 0:
-            matches.append((interaction, score))
+            matches.append((interaction, score, followup_dt))
     
-    # Sort by score (highest first) and return top matches
-    matches.sort(key=lambda x: x[1], reverse=True)
+    # Sort by strongest date match first, then nearest scheduled time.
+    matches.sort(key=lambda x: (-x[1], x[2], x[0].id or 0))
     return [m[0] for m in matches[:limit]]
 
 
 def build_interaction_summary(interaction: Interaction) -> str:
-    """Build a comprehensive summary of an interaction."""
+    """Build a concise, non-duplicative summary using the LLM API with safe fallback."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if api_key:
+        try:
+            from groq import Groq
+
+            client = Groq(api_key=api_key)
+            model = os.environ.get("GROQ_MODEL", "gemma2-9b-it")
+            fallback_model = "llama-3.1-8b-instant"
+            compact_payload = {
+                "interaction_type": interaction.interaction_type,
+                "datetime": interaction.datetime,
+                "attendees": interaction.attendees,
+                "topics": interaction.topics,
+                "materials_shared": interaction.materials_shared,
+                "samples_distributed": interaction.samples_distributed,
+                "sentiment": interaction.sentiment,
+                "outcomes": interaction.outcomes,
+                "follow_up": interaction.follow_up,
+                "notes": interaction.notes,
+            }
+            prompt = (
+                "Create a concise meeting summary from CRM data. "
+                "Do not copy raw notes verbatim, do not repeat duplicate statements, and do not list field labels. "
+                "Write 3-5 short sentences covering: discussion focus, HCP response/sentiment, outcomes, and next follow-up action.\n\n"
+                f"Data:\n{compact_payload}"
+            )
+            for candidate_model in (model, fallback_model):
+                try:
+                    response = client.chat.completions.create(
+                        model=candidate_model,
+                        messages=[
+                            {"role": "system", "content": "You are a medical CRM assistant that writes concise professional summaries."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.2,
+                    )
+                    content = (response.choices[0].message.content or "").strip()
+                    if content:
+                        return content
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # Fallback summary if LLM is unavailable.
     parts: list[str] = []
-    
-    # Core details
     if interaction.interaction_type:
-        parts.append(f"Type: {interaction.interaction_type}")
-    if interaction.datetime:
-        parts.append(f"Date: {interaction.datetime}")
-    
-    # Main content
-    if interaction.notes:
-        parts.append(f"Notes: {interaction.notes}")
-    
-    # Discussion details
+        parts.append(f"{interaction.interaction_type} interaction")
     if interaction.topics:
-        parts.append(f"Topics: {interaction.topics}")
-    if interaction.attendees:
-        parts.append(f"Attendees: {interaction.attendees}")
-    
-    # Materials and sentiment
-    if interaction.materials_shared:
-        parts.append(f"Materials Shared: {interaction.materials_shared}")
-    if interaction.samples_distributed:
-        parts.append(f"Samples: {interaction.samples_distributed}")
+        parts.append(f"focused on {interaction.topics}")
     if interaction.sentiment:
-        parts.append(f"Sentiment: {interaction.sentiment.upper()}")
-    
-    # Outcomes and follow-ups
+        parts.append(f"with {interaction.sentiment} sentiment")
     if interaction.outcomes:
-        parts.append(f"Outcomes: {interaction.outcomes}")
+        parts.append(f"Outcome: {interaction.outcomes}.")
     if interaction.follow_up:
-        parts.append(f"Follow-up: {interaction.follow_up}")
-    
-    return " | ".join(parts)
+        parts.append(f"Next action: {interaction.follow_up}.")
+    if not parts and interaction.notes:
+        short_notes = re.sub(r"\s+", " ", interaction.notes).strip()
+        return short_notes[:240] + ("..." if len(short_notes) > 240 else "")
+    return " ".join(parts).strip() or "No summary available."
 
 
 def build_followup_recommendations(interaction: Interaction) -> list[str]:

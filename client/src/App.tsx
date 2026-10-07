@@ -8,6 +8,7 @@ import {
   selectCrm,
   sendAssistantMessage,
   setText,
+  setHcpQuery,
   setSelectedInteractionId,
   setSelectedHcpId,
   setInteractionType,
@@ -20,6 +21,8 @@ import {
   setFollowUp,
   setMaterials,
   setSamples,
+  type FollowupMatch,
+  type InteractionMatch,
   type Interaction,
 } from './features/crm/crmSlice'
 import { useAppDispatch, useAppSelector } from './store/hooks'
@@ -89,7 +92,9 @@ export default function App() {
   } = state
 
   const lastLoggedMessage = result?.interaction?.notes ?? ''
-  const selectedHcpName = hcps.find(h => h.id === selectedHcpId)?.name || `HCP #${selectedHcpId}`
+  const selectedHcpName = hcpQuery || hcps.find(h => h.id === selectedHcpId)?.name || (selectedHcpId ? `HCP #${selectedHcpId}` : '')
+  const followupMatches = result?.followup_matches ?? []
+  const interactionMatches = result?.interaction_matches ?? []
 
   useEffect(() => {
     void dispatch(loadInteractions(null))
@@ -101,13 +106,14 @@ export default function App() {
     if (!prompt) return
 
     dispatch(clearInsights())
-    const action = await dispatch(sendAssistantMessage({ text: prompt, hcpId: selectedHcpId, interactionId: selectedInteractionId }))
+    const promptLower = prompt.toLowerCase()
+    const wantsSummary = /\b(summary|overview|recap)\b/.test(promptLower)
+    const wantsFollowup = /\b(follow|follow-up|follow up|next steps?|upcoming)\b/.test(promptLower)
+    const wantsSearch = /\b(search|find|look up|lookup|locate)\b/.test(promptLower)
+    const action = await dispatch(sendAssistantMessage({ text: prompt, hcpId: wantsFollowup || wantsSearch ? null : selectedHcpId, interactionId: selectedInteractionId }))
     if (sendAssistantMessage.fulfilled.match(action)) {
-      const promptLower = prompt.toLowerCase()
-      const wantsSummary = /\b(summary|overview|recap)\b/.test(promptLower)
-
       if (action.payload.interaction) {
-        await dispatch(loadInteractions(selectedHcpId))
+        await dispatch(loadInteractions(wantsFollowup || wantsSearch ? null : selectedHcpId))
         
         // If this was an update to the currently selected interaction, refresh the form
         if (selectedInteractionId === action.payload.interaction.id) {
@@ -132,7 +138,7 @@ export default function App() {
     }
   }
 
-  const handleSelectInteraction = async (interaction: Interaction) => {
+  const handleSelectInteraction = async (interaction: Interaction, hcpName?: string, keepInsights = false) => {
     // Set the selected interaction ID
     dispatch(setSelectedInteractionId(interaction.id))
     
@@ -143,6 +149,8 @@ export default function App() {
     if (interaction.hcp_id) {
       dispatch(setSelectedHcpId(interaction.hcp_id))
     }
+    const resolvedHcpName = hcpName || (interaction.hcp_id ? hcps.find(h => h.id === interaction.hcp_id)?.name : '')
+    dispatch(setHcpQuery(resolvedHcpName || ''))
     
     // Populate the form with all the interaction details - always dispatch even if empty to reset
     dispatch(setInteractionType(interaction.interaction_type || 'Meeting'))
@@ -161,7 +169,17 @@ export default function App() {
     dispatch(setMaterials(interaction.materials_shared ? interaction.materials_shared.split(',').map(m => m.trim()).filter(Boolean) : []))
     dispatch(setSamples(interaction.samples_distributed ? interaction.samples_distributed.split(',').map(s => s.trim()).filter(Boolean) : []))
     
-    dispatch(clearInsights())
+    if (!keepInsights) {
+      dispatch(clearInsights())
+    }
+  }
+
+  const handleSelectFollowup = async (match: FollowupMatch) => {
+    await handleSelectInteraction(match.interaction, match.hcp_name, true)
+  }
+
+  const handleSelectInteractionMatch = async (match: InteractionMatch) => {
+    await handleSelectInteraction(match.interaction, match.hcp_name, true)
   }
 
   const handleNewInteraction = () => {
@@ -298,7 +316,7 @@ export default function App() {
                 </>
               )}
 
-              {result?.search_results && result.search_results.length > 0 && (
+              {result?.search_results && result.search_results.length > 0 && interactionMatches.length === 0 && (
                 <div className="flex justify-start">
                   <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-cyan-800 bg-cyan-950/70 px-4 py-3 text-sm text-slate-100 shadow-lg">
                     <p className="text-[11px] uppercase tracking-wide text-cyan-200">AI Assistant</p>
@@ -316,6 +334,32 @@ export default function App() {
                 </div>
               )}
 
+              {interactionMatches.length > 0 && (
+                <div className="flex justify-start">
+                  <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-cyan-800 bg-cyan-950/70 px-4 py-3 text-sm text-slate-100 shadow-lg">
+                    <p className="text-[11px] uppercase tracking-wide text-cyan-200">AI Assistant</p>
+                    <p className="mt-1 font-medium text-cyan-100">Interaction Matches</p>
+                    <div className="mt-2 space-y-2">
+                      {interactionMatches.map((match) => (
+                        <button
+                          key={match.interaction.id}
+                          type="button"
+                          onClick={() => void handleSelectInteractionMatch(match)}
+                          className={`block w-full rounded-md border px-3 py-2 text-left transition-colors ${
+                            selectedInteractionId === match.interaction.id
+                              ? 'border-blue-500 bg-slate-800'
+                              : 'border-cyan-900/70 bg-slate-900/70 hover:border-cyan-500 hover:bg-slate-800'
+                          }`}
+                        >
+                          <span className="block font-medium text-cyan-100">{match.hcp_name}</span>
+                          <span className="mt-1 block text-xs text-slate-300">{match.title || match.interaction.topics || 'Interaction'}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {summary && (
                 <div className="flex justify-start">
                   <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-purple-800 bg-purple-950/70 px-4 py-3 text-sm text-slate-100 shadow-lg">
@@ -325,7 +369,33 @@ export default function App() {
                 </div>
               )}
 
-              {recommendations && recommendations.length > 0 && (
+              {followupMatches.length > 0 && (
+                <div className="flex justify-start">
+                  <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-amber-800 bg-amber-950/70 px-4 py-3 text-sm text-slate-100 shadow-lg">
+                    <p className="text-[11px] uppercase tracking-wide text-amber-200">AI Assistant</p>
+                    <p className="mt-1 font-medium text-amber-100">Scheduled Followups</p>
+                    <div className="mt-2 space-y-2">
+                      {followupMatches.map((match) => (
+                        <button
+                          key={match.interaction.id}
+                          type="button"
+                          onClick={() => void handleSelectFollowup(match)}
+                          className={`block w-full rounded-md border px-3 py-2 text-left transition-colors ${
+                            selectedInteractionId === match.interaction.id
+                              ? 'border-blue-500 bg-slate-800'
+                              : 'border-amber-900/70 bg-slate-900/70 hover:border-amber-500 hover:bg-slate-800'
+                          }`}
+                        >
+                          <span className="block font-medium text-amber-100">{match.hcp_name}</span>
+                          <span className="mt-1 block text-xs text-slate-300">{match.follow_up || 'Follow-up scheduled'}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {recommendations && recommendations.length > 0 && followupMatches.length === 0 && (
                 <div className="flex justify-start">
                   <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-amber-800 bg-amber-950/70 px-4 py-3 text-sm text-slate-100 shadow-lg">
                     <p className="text-[11px] uppercase tracking-wide text-amber-200">AI Assistant</p>
